@@ -7,7 +7,7 @@
  * The interrupts of the OpenTitan's I2C block.
  *
  * Documentation source can be found at:
- * https://github.com/lowRISC/opentitan/blob/9ddf276c64e2974ed8e528e8b2feb00b977861de/hw/ip/i2c/doc/interfaces.md
+ * https://github.com/lowRISC/opentitan/blob/4fe1b8dd1a09af9dbc242434481ae031955dfd85/hw/ip/i2c/doc/interfaces.md
  */
 enum class OpenTitanI2cInterrupt
 {
@@ -31,10 +31,12 @@ enum class OpenTitanI2cInterrupt
 	 */
 	ReceiveOverflow,
 	/**
-	 * A host mode interrupt. This is raised if there is no ACK in response to
-	 * an address or data.
+	 * A host mode interrupt. This is raised if the controller FSM is halted,
+	 * such as on an unexpected NACK or lost arbitration. Check the
+	 * `controllerEvents` register for the reason. The interrupt will only be
+	 * released when the bits in `controllerEvents` are cleared.
 	 */
-	Nak,
+	ControllerHalt,
 	/**
 	 * A host mode interrupt. This is raised if the SCL line drops early (not
 	 * supported without clock synchronization).
@@ -98,7 +100,7 @@ static constexpr uint32_t interrupt_bit(const OpenTitanI2cInterrupt Interrupt)
  * Driver for the OpenTitan's I2C block.
  *
  * Documentation source can be found at:
- * https://github.com/lowRISC/opentitan/tree/9ddf276c64e2974ed8e528e8b2feb00b977861de/hw/ip/i2c
+ * https://github.com/lowRISC/opentitan/tree/4fe1b8dd1a09af9dbc242434481ae031955dfd85/hw/ip/i2c
  */
 struct OpenTitanI2c
 {
@@ -158,10 +160,23 @@ struct OpenTitanI2c
 	 */
 	uint32_t targetNackCount;
 	/**
+	 * Controls for mid-transfer (N)ACK phase handling.
+	 */
+	uint32_t targetAckControl;
+	/// The data byte pending to be written to the Acquire (ACQ) FIFO.
+	uint32_t acquireFifoNextData;
+	/**
 	 * Timeout in Host-Mode for an unhandled NACK before hardware automatically
 	 * ends the transaction.
 	 */
-	uint32_t targetAckControl;
+	uint32_t hostNackHandlerTimeout;
+	/// Latched events that explain why the controller halted.
+	uint32_t controllerEvents;
+	/**
+	 * Latched events that can cause the target module to stretch the clock at
+	 * the beginning of a read transfer.
+	 */
+	uint32_t targetEvents;
 
 	/// Control Register Fields
 	enum [[clang::flag_enum]] : uint32_t{
@@ -172,6 +187,20 @@ struct OpenTitanI2c
 	  /// Enable I2C line loopback test If line loopback is enabled, the
 	  /// internal design sees ACQ and RX data as "1"
 	  ControlLineLoopback = 1 << 2,
+	  /// Enable NACKing the address on a stretch timeout. This is a target
+	  /// mode feature. If enabled, a stretch timeout will cause the device to
+	  /// NACK the address byte. If disabled, it will ACK instead.
+	  ControlNackAddressAfterTimeout = 1 << 3,
+	  /// Enable ACK Control Mode, which works with the `targetAckControl`
+	  /// register to allow software to control upper-layer (N)ACKing.
+	  ControlAckControlEnable = 1 << 4,
+	  /// Enable the bus monitor in multi-controller mode.
+	  ControlMultiControllerMonitorEnable = 1 << 5,
+	  /// If set, causes a read transfer addressed to the this target to set
+	  /// the corresponding bit in the `targetEvents` register. While the
+	  /// `transmitPending` field is 1, subsequent read transactions will
+	  /// stretch the clock, even if there is data in the Transmit FIFO.
+	  ControlTransmitStretchEnable = 1 << 6,
 	};
 
 	/// Status Register Fields
@@ -190,18 +219,15 @@ struct OpenTitanI2c
 	  SmatusReceiveEmpty = 1 << 5,
 	  /// Target mode Transmit FIFO is full
 	  StatusTransmitFull = 1 << 6,
-	  /// Target mode Receive FIFO is full
+	  /// Target mode Acquired FIFO is full
 	  StatusAcquiredFull = 1 << 7,
 	  /// Target mode Transmit FIFO is empty
 	  StatusTransmitEmpty = 1 << 8,
-	  /// Target mode Aquired FIFO is empty
+	  /// Target mode Acquired FIFO is empty
 	  StatusAcquiredEmpty = 1 << 9,
-	  /**
-	   * A Host-Mode active transaction has been ended by the
-	   * HostNackHandlerTimeout mechanism. This bit is cleared when
-	   * Control.EnableHost is set by software to start a new transaction.
-	   */
-	  StatusHostDisabledNackTimeout = 1 << 10,
+	  /// Target mode stretching at (N)ACK phase due to zero count
+	  /// in the `targetAckControl` register.
+	  StatusAckControlStretch = 1 << 10,
 	};
 
 	/// FormatData Register Fields
@@ -227,10 +253,31 @@ struct OpenTitanI2c
 	  FifoControlReceiveReset = 1 << 0,
 	  /// Format fifo reset. Write 1 to the register resets it. Read returns 0
 	  FifoControlFormatReset = 1 << 1,
-	  /// Aquired FIFO reset. Write 1 to the register resets it. Read returns 0
+	  /// Acquired FIFO reset. Write 1 to the register resets it. Read returns 0
 	  FifoControlAcquiredReset = 1 << 7,
 	  /// Transmit FIFO reset. Write 1 to the register resets it. Read returns 0
 	  FifoControlTransmitReset = 1 << 8,
+	};
+
+	/// ControllerEvents Register Fields
+	enum [[clang::flag_enum]] : uint32_t{
+	  /// Controller FSM is halted due to receiving an unexpected NACK.
+	  ControllerEventsNack = 1 << 0,
+	  /**
+	   * Controller FSM is halted due to a Host-Mode active transaction being
+	   * ended by the `hostNackHandlerTimeout` mechanism.
+	   */
+	  ControllerEventsUnhandledNackTimeout = 1 << 1,
+	  /**
+	   * Controller FSM is halted due to a Host-Mode active transaction being
+	   * terminated because of a bus timeout activated by `timeoutControl`.
+	   */
+	  ControllerEventsBusTimeout = 1 << 2,
+	  /**
+	   * Controller FSM is halted due to a Host-Mode active transaction being
+	   * terminated because of lost arbitration.
+	   */
+	  ControllerEventsArbitrationLost = 1 << 3,
 	};
 
 	// Referred to as 'RX FIFO' in the documentation
@@ -258,6 +305,26 @@ struct OpenTitanI2c
 		Debug::Assert(Res <= UINT16_MAX,
 		              "Division result too large to fit in uint16_t.");
 		return static_cast<uint16_t>(Res);
+	}
+
+	/**
+	 * Reset the controller Events so that the `ControllerHalt` interrupt will
+	 * be released, allowing the I2C driver to continue after the controller
+	 * FSM has halted due to e.g. a NACK, configured timeout, or loss of
+	 * arbitration.
+	 *
+	 * Returns the (masked) result of reading the register before clearing
+	 * the controller events, so that you can use the `controllerEvent`
+	 * register fields to determine why the Controller FSM was halted.
+	 */
+	uint32_t reset_controller_events() volatile
+	{
+		constexpr uint32_t FieldMask =
+		  (ControllerEventsNack | ControllerEventsUnhandledNackTimeout |
+		   ControllerEventsBusTimeout | ControllerEventsArbitrationLost);
+		uint32_t events  = controllerEvents & FieldMask;
+		controllerEvents = FieldMask;
+		return events;
 	}
 
 	/// Reset all of the fifos.
@@ -365,9 +432,9 @@ struct OpenTitanI2c
 		{
 			blocking_write_byte(FormatDataStart | (Addr7 << 1) | 1u);
 			while (!format_is_empty()) {}
-			if (interrupt_is_asserted(OpenTitanI2cInterrupt::Nak))
+			if (interrupt_is_asserted(OpenTitanI2cInterrupt::ControllerHalt))
 			{
-				interrupt_clear(OpenTitanI2cInterrupt::Nak);
+				reset_controller_events();
 				return false;
 			}
 			uint32_t bytesRemaining = NumBytes - idx;
