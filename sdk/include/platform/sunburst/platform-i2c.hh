@@ -406,14 +406,14 @@ struct OpenTitanI2c
 		return 0 != (StatusFormatEmpty & status);
 	}
 
-	void blocking_write(const uint8_t  Addr7,
-	                    const uint8_t  data[],
-	                    const uint32_t NumBytes,
-	                    const bool     SkipStop) volatile
+	[[nodiscard]] bool blocking_write(const uint8_t  Addr7,
+	                                  const uint8_t  data[],
+	                                  const uint32_t NumBytes,
+	                                  const bool     SkipStop) volatile
 	{
 		if (NumBytes == 0)
 		{
-			return;
+			return true;
 		}
 		blocking_write_byte(FormatDataStart | (Addr7 << 1) | 0u);
 		for (uint32_t i = 0; i < NumBytes - 1; ++i)
@@ -422,6 +422,15 @@ struct OpenTitanI2c
 		}
 		blocking_write_byte((SkipStop ? 0u : FormatDataStop) |
 		                    data[NumBytes - 1]);
+		while (!format_is_empty())
+		{
+			if (interrupt_is_asserted(OpenTitanI2cInterrupt::ControllerHalt))
+			{
+				reset_controller_events();
+				return false;
+			}
+		}
+		return true;
 	}
 
 	[[nodiscard]] bool blocking_read(const uint8_t  Addr7,
