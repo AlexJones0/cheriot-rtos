@@ -435,6 +435,9 @@ class Ksz8851Ethernet
 		transmitBuffer = std::make_unique<uint8_t[]>(MaxFrameSize);
 		receiveBuffer  = std::make_unique<uint8_t[]>(MaxFrameSize);
 
+		// Initialize the Ethernet MAC SPI
+		spi()->init(false, false, true, 0);
+
 		// Reset chip. It needs to be hold in reset for at least 10ms.
 		spi()->reset_assert(true);
 		thread_millisecond_wait(20);
